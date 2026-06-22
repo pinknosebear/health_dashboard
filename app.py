@@ -190,16 +190,19 @@ with tab_glucose:
 
     st.divider()
 
-    # Glucose mean over time with 70-180 shaded band
-    if "glucose_mean" in metric_cols:
-        st.markdown("#### Glucose Mean (mg/dL)")
+    # Date range selector for both glucose charts
+    if "glucose_mean" in metric_cols or "time_in_range" in metric_cols:
         min_d, max_d = df["date"].min().date(), df["date"].max().date()
         default_start = max(min_d, (df["date"].max() - pd.Timedelta(days=180)).date())
         date_range = st.slider(
-            "Date range for glucose", min_value=min_d, max_value=max_d,
+            "Date range", min_value=min_d, max_value=max_d,
             value=(default_start, max_d), format="YYYY-MM-DD", key="glucose_date_range"
         )
         mask = (df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= date_range[1])
+
+    # Glucose mean over time with 70-180 shaded band
+    if "glucose_mean" in metric_cols:
+        st.markdown("#### Glucose Mean (mg/dL)")
         glucose_sub = df[mask][["date", "glucose_mean"]].dropna()
 
         if not glucose_sub.empty:
@@ -210,7 +213,7 @@ with tab_glucose:
                          annotation_text="Target Range", annotation_position="right")
             fig.update_layout(title="Glucose Mean Over Time", height=400,
                             yaxis_title="Glucose (mg/dL)", xaxis_title="Date")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     # Time in range over time
     if "time_in_range" in metric_cols:
@@ -225,7 +228,7 @@ with tab_glucose:
                          annotation_text="Target: 70%", annotation_position="right")
             fig.update_layout(title="Time in Range Over Time", height=400,
                             yaxis_title="Time in Range (%)", xaxis_title="Date")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 # ---------------------------------------------------------------- Labs
 with tab_labs:
