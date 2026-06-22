@@ -25,13 +25,16 @@ METRIC_LABELS = {
     "active_calories": "Active Calories",
     "exercise_minutes": "Exercise (min)",
     "weight_lbs": "Weight (lb)",
-    "fat_mass_lbs": "Fat Mass (lb)",
-    "muscle_mass_lbs": "Muscle Mass (lb)",
-    "bone_mass_lbs": "Bone Mass (lb)",
-    "hydration_lbs": "Hydration (lb)",
-    "bp_heart_rate": "BP Heart Rate (bpm)",
     "systolic": "Systolic (mmHg)",
     "diastolic": "Diastolic (mmHg)",
+    "glucose_mean": "Avg Glucose (mg/dL)",
+    "glucose_min": "Min Glucose (mg/dL)",
+    "glucose_max": "Max Glucose (mg/dL)",
+    "glucose_std": "Glucose Variability (mg/dL)",
+    "time_in_range": "Time in Range (%)",
+    "gmi": "GMI (est. A1c %)",
+    "body_fat_pct": "Body Fat (%)",
+    "lean_mass_lbs": "Lean Mass (lb)",
 }
 
 st.set_page_config(page_title="Trajectory", page_icon="📈", layout="wide")
@@ -43,6 +46,14 @@ def load_metrics():
     df = pd.read_sql("SELECT * FROM daily_metrics", conn, parse_dates=["date"])
     conn.close()
     return df.sort_values("date").reset_index(drop=True)
+
+
+@st.cache_data
+def load_labs():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql("SELECT * FROM lab_results ORDER BY date DESC", conn, parse_dates=["date"])
+    conn.close()
+    return df
 
 
 def load_experiments():
@@ -108,8 +119,8 @@ metric_cols = [c for c in df.columns if c != "date" and df[c].notna().any()]
 st.title("📈 Trajectory")
 st.caption("An AI-powered N-of-1 health experimentation platform")
 
-tab_overview, tab_trends, tab_corr, tab_exp, tab_log = st.tabs(
-    ["Overview", "Trends", "Correlations", "Experiments", "Daily Log"]
+tab_overview, tab_glucose, tab_labs, tab_trends, tab_corr, tab_exp, tab_log = st.tabs(
+    ["Overview", "Glucose", "Labs", "Trends", "Correlations", "Experiments", "Daily Log"]
 )
 
 # ---------------------------------------------------------------- Overview
@@ -121,8 +132,8 @@ with tab_overview:
                (df["date"] > last_date - pd.Timedelta(days=14))]
 
     card_metrics = [m for m in [
-        "steps", "sleep_hours", "hrv", "resting_hr", "active_calories",
-        "exercise_minutes", "weight_lbs", "fat_mass_lbs", "muscle_mass_lbs",
+        "glucose_mean", "time_in_range", "gmi", "steps", "sleep_hours", "hrv", "resting_hr",
+        "active_calories", "exercise_minutes", "weight_lbs",
     ] if m in metric_cols]
 
     cols = st.columns(3)
@@ -136,9 +147,144 @@ with tab_overview:
             delta = f"{(cur - prev) / prev * 100:+.1f}%"
         cols[i % 3].metric(label(m), f"{cur:,.1f}", delta)
 
+    # Show latest A1c from labs
+    labs_df = load_labs()
+    if not labs_df.empty:
+        a1c_data = labs_df[labs_df["test"] == "Hemoglobin A1c"]
+        if not a1c_data.empty:
+            latest_a1c = a1c_data.iloc[0]
+            st.divider()
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Latest A1c", f"{latest_a1c['value']:.1f}%",
+                       f"({latest_a1c['date'].strftime('%Y-%m-%d')})")
+
     st.divider()
     st.caption(f"Data spans {df['date'].min():%Y-%m-%d} to {df['date'].max():%Y-%m-%d} "
                f"({len(df)} days)")
+
+# ---------------------------------------------------------------- Glucose
+with tab_glucose:
+    st.subheader("Glucose Metrics")
+
+    # KPI cards
+    col1, col2, col3 = st.columns(3)
+    if "glucose_mean" in metric_cols:
+        latest_glucose = df[df["glucose_mean"].notna()].iloc[-1] if not df[df["glucose_mean"].notna()].empty else None
+        if latest_glucose is not None:
+            col1.metric("Latest Avg Glucose", f"{latest_glucose['glucose_mean']:.1f} mg/dL",
+                       f"({latest_glucose['date'].strftime('%Y-%m-%d')})")
+
+    if "time_in_range" in metric_cols:
+        latest_tir = df[df["time_in_range"].notna()].iloc[-1] if not df[df["time_in_range"].notna()].empty else None
+        if latest_tir is not None:
+            col2.metric("Latest Time in Range", f"{latest_tir['time_in_range']:.1f}%",
+                       f"({latest_tir['date'].strftime('%Y-%m-%d')})")
+
+    labs_df = load_labs()
+    if not labs_df.empty:
+        a1c_data = labs_df[labs_df["test"] == "Hemoglobin A1c"]
+        if not a1c_data.empty:
+            latest_a1c = a1c_data.iloc[0]
+            col3.metric("Latest A1c", f"{latest_a1c['value']:.1f}%",
+                       f"({latest_a1c['date'].strftime('%Y-%m-%d')})")
+
+    st.divider()
+
+    # Glucose mean over time with 70-180 shaded band
+    if "glucose_mean" in metric_cols:
+        st.markdown("#### Glucose Mean (mg/dL)")
+        min_d, max_d = df["date"].min().date(), df["date"].max().date()
+        default_start = max(min_d, (df["date"].max() - pd.Timedelta(days=180)).date())
+        date_range = st.slider(
+            "Date range for glucose", min_value=min_d, max_value=max_d,
+            value=(default_start, max_d), format="YYYY-MM-DD", key="glucose_date_range"
+        )
+        mask = (df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= date_range[1])
+        glucose_sub = df[mask][["date", "glucose_mean"]].dropna()
+
+        if not glucose_sub.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=glucose_sub["date"], y=glucose_sub["glucose_mean"],
+                                    mode="lines+markers", name="Glucose Mean", opacity=0.6))
+            fig.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.1, line_width=0,
+                         annotation_text="Target Range", annotation_position="right")
+            fig.update_layout(title="Glucose Mean Over Time", height=400,
+                            yaxis_title="Glucose (mg/dL)", xaxis_title="Date")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Time in range over time
+    if "time_in_range" in metric_cols:
+        st.markdown("#### Time in Range (%)")
+        tir_sub = df[mask][["date", "time_in_range"]].dropna()
+        if not tir_sub.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=tir_sub["date"], y=tir_sub["time_in_range"],
+                                    mode="lines+markers", name="Time in Range", opacity=0.6,
+                                    line=dict(color="green")))
+            fig.add_hline(y=70, line_dash="dash", line_color="gray",
+                         annotation_text="Target: 70%", annotation_position="right")
+            fig.update_layout(title="Time in Range Over Time", height=400,
+                            yaxis_title="Time in Range (%)", xaxis_title="Date")
+            st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------------------------------------------- Labs
+with tab_labs:
+    st.subheader("Laboratory Results")
+
+    labs_df = load_labs()
+    if labs_df.empty:
+        st.info("No laboratory results available.")
+    else:
+        # Get unique panels and tests
+        panels = sorted(labs_df["panel"].unique())
+        selected_panel = st.selectbox("Panel", panels)
+
+        panel_data = labs_df[labs_df["panel"] == selected_panel]
+        tests = sorted(panel_data["test"].unique())
+        selected_test = st.selectbox("Test", tests)
+
+        test_data = labs_df[labs_df["test"] == selected_test].sort_values("date")
+
+        if not test_data.empty:
+            # Get reference range if available
+            ref_low = test_data["ref_low"].iloc[0] if "ref_low" in test_data.columns else None
+            ref_high = test_data["ref_high"].iloc[0] if "ref_high" in test_data.columns else None
+
+            # Color code points based on range
+            colors = []
+            for _, row in test_data.iterrows():
+                value = row["value"]
+                if ref_low is not None and ref_high is not None:
+                    if pd.notna(ref_low) and pd.notna(ref_high):
+                        if ref_low <= value <= ref_high:
+                            colors.append("green")
+                        else:
+                            colors.append("red")
+                    else:
+                        colors.append("blue")
+                else:
+                    colors.append("blue")
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=test_data["date"], y=test_data["value"],
+                                    mode="lines+markers", name=selected_test,
+                                    marker=dict(color=colors, size=8)))
+
+            # Add reference range as shaded band
+            if ref_low is not None and ref_high is not None:
+                if pd.notna(ref_low) and pd.notna(ref_high):
+                    fig.add_hrect(y0=ref_low, y1=ref_high, fillcolor="green", opacity=0.1,
+                                 line_width=0, annotation_text="Normal Range",
+                                 annotation_position="right")
+
+            fig.update_layout(title=f"{selected_test} Over Time", height=400,
+                            yaxis_title="Value", xaxis_title="Date")
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Show recent results table
+            st.markdown("#### Recent Results")
+            recent_results = test_data[["date", "value", "ref_low", "ref_high"]].tail(5).sort_values("date", ascending=False)
+            st.dataframe(recent_results, use_container_width=True)
 
 # ---------------------------------------------------------------- Trends
 with tab_trends:
@@ -155,7 +301,7 @@ with tab_trends:
         )
     selected = st.multiselect(
         "Metrics", metric_cols,
-        default=[m for m in ["steps", "sleep_hours", "weight_lbs"] if m in metric_cols],
+        default=[m for m in ["glucose_mean", "steps", "sleep_hours"] if m in metric_cols],
         format_func=label,
     )
 
