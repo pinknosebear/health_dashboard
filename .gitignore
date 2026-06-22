@@ -1,0 +1,19 @@
+# Data files (health privacy)
+*.csv
+export.xml
+
+# Generated database
+health.db
+
+# Python/venv
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
