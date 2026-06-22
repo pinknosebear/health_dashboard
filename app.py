@@ -8,10 +8,15 @@ import os
 import sqlite3
 from datetime import datetime
 
+import google.generativeai as genai
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+import education
+import goals
+import quick_log
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "health.db")
@@ -56,6 +61,20 @@ def load_labs():
     return df
 
 
+CGM_PATH = "/Users/amrutha/Downloads/test results/libre3_cgm.csv"
+
+
+@st.cache_data
+def load_cgm_raw():
+    if not os.path.exists(CGM_PATH):
+        return pd.DataFrame()
+    cgm = pd.read_csv(CGM_PATH, skiprows=1, low_memory=False)
+    cgm["timestamp"] = pd.to_datetime(cgm["Device Timestamp"], format="%m-%d-%Y %I:%M %p")
+    cgm = cgm[cgm["Record Type"] == 0].copy()
+    cgm["glucose"] = pd.to_numeric(cgm["Historic Glucose mg/dL"], errors="coerce")
+    return cgm[["timestamp", "glucose"]].dropna().sort_values("timestamp")
+
+
 def load_experiments():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql("SELECT * FROM experiments", conn)
@@ -86,13 +105,13 @@ def load_daily_log(date_str=None):
     return df
 
 
-def add_daily_log(date, entry_type, meal_type, rating, notes, photo_bytes, photo_filename):
+def add_daily_log(date, entry_type, meal_type, rating, notes, photo_bytes, photo_filename, logged_time=None):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO daily_log
-           (date, entry_type, meal_type, rating, notes, photo, photo_filename)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (str(date), entry_type, meal_type, rating, notes, photo_bytes, photo_filename),
+           (date, logged_time, entry_type, meal_type, rating, notes, photo, photo_filename)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (str(date), logged_time, entry_type, meal_type, rating, notes, photo_bytes, photo_filename),
     )
     conn.commit()
     conn.close()
@@ -109,6 +128,121 @@ def label(col):
     return METRIC_LABELS.get(col, col)
 
 
+def compute_insight_cards(df, metric_cols, last_date):
+    """Return list of (metric, r, sentence) for top 3 glucose correlations."""
+    if "glucose_mean" not in df.columns or df["glucose_mean"].notna().sum() < 10:
+        return []
+
+    numeric = [c for c in metric_cols if c != "glucose_mean" and df[c].notna().sum() > 10]
+    corrs = []
+    for m in numeric:
+        pair = df[["glucose_mean", m]].dropna()
+        if len(pair) > 10:
+            r = pair["glucose_mean"].corr(pair[m])
+            if pd.notna(r):
+                corrs.append((m, r))
+
+    corrs.sort(key=lambda x: abs(x[1]), reverse=True)
+    top3 = corrs[:3]
+
+    recent = df[df["date"] > last_date - pd.Timedelta(days=7)]
+
+    cards = []
+    for m, r in top3:
+        week_val = recent[m].mean()
+        week_str = f" ({label(m)} this week: {week_val:.1f})" if pd.notna(week_val) else ""
+
+        if m == "sleep_hours":
+            direction = "More sleep → lower glucose." if r < 0 else "Less sleep → lower glucose."
+            sentence = f"Sleep predicts glucose (r={r:+.2f}). {direction}{week_str}"
+        elif m == "steps":
+            more_less = "More" if r < 0 else "Fewer"
+            high_low = "lower" if r < 0 else "higher"
+            sentence = f"{more_less} steps → {high_low} glucose (r={r:+.2f}).{week_str}"
+        elif m == "weight_lbs":
+            direction = "negatively" if r < 0 else "positively"
+            sentence = f"Weight {direction} tracks glucose (r={r:+.2f}).{week_str}"
+        elif m == "exercise_minutes":
+            direction = "reduces" if r < 0 else "raises"
+            sentence = f"Exercise {direction} glucose (r={r:+.2f}).{week_str}"
+        elif m == "hrv":
+            direction = "inversely" if r < 0 else "positively"
+            sentence = f"HRV {direction} tracks glucose (r={r:+.2f}).{week_str}"
+        else:
+            sentence = f"{label(m)} correlates with glucose (r={r:+.2f}).{week_str}"
+
+        cards.append((m, r, sentence))
+
+    return cards
+
+
+def get_available_gemini_models(api_key: str):
+    """List available Gemini models for generateContent."""
+    try:
+        genai.configure(api_key=api_key)
+        models = [m.name.replace("models/", "") for m in genai.list_models()
+                  if "generateContent" in m.supported_generation_methods]
+        return sorted(models)
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=86400)
+def generate_weekly_summary(week_stats: dict, lab_trend: str, correlations: str) -> str:
+    """Call Gemini API to generate a weekly health summary."""
+    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
+    if not api_key:
+        return "_No API key configured. Add GEMINI_API_KEY to .streamlit/secrets.toml_"
+
+    prompt = f"""You are a health coach assistant for a 56-year-old male with Type 2 diabetes (Ravi).
+Analyze this week's health data and provide a concise, actionable summary.
+
+PATIENT CONTEXT: Type 2 diabetic, on medication, using Libre3 CGM + Apple Watch.
+
+THIS WEEK'S DATA:
+{week_stats}
+
+LAB HISTORY:
+{lab_trend}
+
+TOP CORRELATIONS (all-time):
+{correlations}
+
+Respond in exactly this format with these 4 sections:
+
+## What went well this week
+[1-2 sentences on positive patterns — e.g. glucose in range, good sleep, active days]
+
+## What to watch
+[1-2 sentences on warning signs — high glucose days, poor sleep, trends to monitor]
+
+## One experiment to run next week
+[One specific, time-bound hypothesis to test. Format: "Try X for Y days to see if Z improves."]
+
+## One question for your doctor
+[One specific clinical question based on lab trends or current data — e.g. eGFR declining, creatinine elevated]
+
+Keep each section to 2-3 sentences max. Be specific, not generic."""
+
+    genai.configure(api_key=api_key)
+
+    # Get list of available models for generateContent
+    available = get_available_gemini_models(api_key)
+    if not available:
+        return "_Could not list available models. Check API key and network connection._"
+
+    # Try available models (prefer latest)
+    for model_name in available:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            if model_name == available[-1]:  # Last model failed
+                return f"Error: Could not generate summary with available models: {available}. Error: {str(e)}"
+            continue
+
+
 if not os.path.exists(DB_PATH):
     st.error("health.db not found. Run `python ingest.py` first.")
     st.stop()
@@ -119,14 +253,25 @@ metric_cols = [c for c in df.columns if c != "date" and df[c].notna().any()]
 st.title("📈 Trajectory")
 st.caption("An AI-powered N-of-1 health experimentation platform")
 
-tab_overview, tab_glucose, tab_labs, tab_trends, tab_corr, tab_exp, tab_log = st.tabs(
-    ["Overview", "Glucose", "Labs", "Trends", "Correlations", "Experiments", "Daily Log"]
+(tab_overview, tab_goals, tab_glucose, tab_labs, tab_trends, tab_corr,
+ tab_exp, tab_log, tab_learn, tab_summary) = st.tabs(
+    ["Overview", "Goals", "Glucose", "Labs", "Trends", "Correlations",
+     "Experiments", "Daily Log", "Learn", "Weekly Summary"]
 )
 
 # ---------------------------------------------------------------- Overview
 with tab_overview:
-    st.subheader("Last 7 days")
     last_date = df["date"].max()
+
+    insight_cards = compute_insight_cards(df, metric_cols, last_date)
+    if insight_cards:
+        st.markdown("#### Key Insights")
+        ins_cols = st.columns(len(insight_cards))
+        for i, (m, r, sentence) in enumerate(insight_cards):
+            ins_cols[i].info(sentence)
+        st.divider()
+
+    st.subheader("Last 7 days")
     recent = df[df["date"] > last_date - pd.Timedelta(days=7)]
     prior = df[(df["date"] <= last_date - pd.Timedelta(days=7)) &
                (df["date"] > last_date - pd.Timedelta(days=14))]
@@ -145,7 +290,8 @@ with tab_overview:
         delta = None
         if not pd.isna(prev) and prev != 0:
             delta = f"{(cur - prev) / prev * 100:+.1f}%"
-        cols[i % 3].metric(label(m), f"{cur:,.1f}", delta)
+        cols[i % 3].metric(label(m), f"{cur:,.1f}", delta,
+                           help=education.help_text(m) or None)
 
     # Show latest A1c from labs
     labs_df = load_labs()
@@ -156,11 +302,98 @@ with tab_overview:
             st.divider()
             col1, col2, col3 = st.columns(3)
             col1.metric("Latest A1c", f"{latest_a1c['value']:.1f}%",
-                       f"({latest_a1c['date'].strftime('%Y-%m-%d')})")
+                       f"({latest_a1c['date'].strftime('%Y-%m-%d')})",
+                       help=education.help_text("Hemoglobin A1c"))
 
     st.divider()
     st.caption(f"Data spans {df['date'].min():%Y-%m-%d} to {df['date'].max():%Y-%m-%d} "
                f"({len(df)} days)")
+
+# ---------------------------------------------------------------- Goals
+with tab_goals:
+    st.subheader("🎯 Long-term Goals")
+    st.caption("Set the targets that matter to you and watch your trajectory toward them.")
+
+    labs_for_goals = load_labs()
+    goals_df = goals.load_goals()
+
+    score = goals.overall_score(goals_df, df, labs_for_goals)
+    if score is not None:
+        st.progress(min(1.0, score / 100.0),
+                    text=f"Overall progress across goals: {score:.0f}%")
+        st.divider()
+
+    if goals_df.empty:
+        st.info("No goals yet. Add one below to start tracking your trajectory.")
+    else:
+        for _, g in goals_df.iterrows():
+            prog = goals.compute_progress(g, df, labs_for_goals)
+            with st.container(border=True):
+                c1, c2 = st.columns([0.88, 0.12])
+                with c1:
+                    title = g.get("label") or g.get("metric")
+                    badge = ""
+                    if prog.get("met"):
+                        badge = " &nbsp;✅ **met**"
+                    elif prog.get("on_track") is True:
+                        badge = " &nbsp;🟢 on track"
+                    elif prog.get("on_track") is False:
+                        badge = " &nbsp;🟠 off track"
+                    st.markdown(f"**{title}**{badge}")
+                    pct = prog.get("pct_to_goal")
+                    if pct is not None:
+                        st.progress(pct / 100.0)
+                    sub = []
+                    if prog.get("current") is not None:
+                        sub.append(f"Now: **{prog['current']:.1f}**")
+                    if prog.get("target") is not None:
+                        sub.append(f"Target: {prog['target']:.1f}")
+                    if g.get("target_date"):
+                        sub.append(f"By: {g['target_date']}")
+                    delta = prog.get("delta_recent")
+                    if delta is not None and abs(delta) > 1e-9:
+                        improving = (delta > 0) if prog["direction"] == "above" else (delta < 0)
+                        sub.append("📈 improving" if improving else "📉 worsening")
+                    st.caption("  ·  ".join(sub))
+                with c2:
+                    if st.button("🗑", key=f"del_goal_{g['id']}", help="Delete goal"):
+                        goals.delete_goal(g["id"])
+                        st.rerun()
+
+    st.divider()
+    with st.expander("➕ New goal", expanded=goals_df.empty):
+        opts = goals.GOALABLE
+        idx = st.selectbox(
+            "Metric", range(len(opts)),
+            format_func=lambda i: f"{opts[i]['label']} ({opts[i]['unit']})",
+            key="goal_metric_idx",
+        )
+        chosen = opts[idx]
+        help_md = education.help_text(chosen["key"])
+        if help_md:
+            st.caption(help_md.split("\n\n")[0])  # show the "What:" line as a hint
+        c1, c2 = st.columns(2)
+        direction = c1.radio(
+            "Direction", ["below", "above"],
+            index=0 if chosen["direction"] == "below" else 1,
+            horizontal=True, key=f"goal_dir_{chosen['key']}",
+        )
+        target_value = c2.number_input(
+            "Target value", value=float(chosen["default"]),
+            key=f"goal_target_{chosen['key']}",
+        )
+        c3, c4 = st.columns(2)
+        target_date = c3.date_input("Target date", value=datetime.today(),
+                                    key="goal_target_date")
+        notes = c4.text_input("Notes", placeholder="Optional", key="goal_notes")
+        if st.button("Create goal", type="primary"):
+            goals.add_goal(
+                chosen["key"], chosen["source"], direction, float(target_value),
+                str(target_date), unit=chosen["unit"], label=chosen["label"],
+                notes=notes or None,
+            )
+            st.success(f"Goal added: {chosen['label']}")
+            st.rerun()
 
 # ---------------------------------------------------------------- Glucose
 with tab_glucose:
@@ -175,7 +408,8 @@ with tab_glucose:
             if not glucose_data.empty:
                 latest_glucose = glucose_data.iloc[-1]
                 col1.metric("Latest Avg Glucose", f"{latest_glucose['glucose_mean']:.1f} mg/dL",
-                           f"({pd.Timestamp(latest_glucose['date']).strftime('%Y-%m-%d')})")
+                           f"({pd.Timestamp(latest_glucose['date']).strftime('%Y-%m-%d')})",
+                           help=education.help_text("glucose_mean"))
     except Exception as e:
         col1.error(f"Error loading glucose: {str(e)[:50]}")
 
@@ -185,7 +419,8 @@ with tab_glucose:
             if not tir_data.empty:
                 latest_tir = tir_data.iloc[-1]
                 col2.metric("Latest Time in Range", f"{latest_tir['time_in_range']:.1f}%",
-                           f"({pd.Timestamp(latest_tir['date']).strftime('%Y-%m-%d')})")
+                           f"({pd.Timestamp(latest_tir['date']).strftime('%Y-%m-%d')})",
+                           help=education.help_text("time_in_range"))
     except Exception as e:
         col2.error(f"Error loading TIR: {str(e)[:50]}")
 
@@ -195,12 +430,13 @@ with tab_glucose:
         if not a1c_data.empty:
             latest_a1c = a1c_data.iloc[0]
             col3.metric("Latest A1c", f"{latest_a1c['value']:.1f}%",
-                       f"({latest_a1c['date'].strftime('%Y-%m-%d')})")
+                       f"({latest_a1c['date'].strftime('%Y-%m-%d')})",
+                       help=education.help_text("Hemoglobin A1c"))
 
     st.divider()
 
-    # Date range selector for both glucose charts
-    if "glucose_mean" in metric_cols or "time_in_range" in metric_cols:
+    # Date range selector for both glucose charts — always defined if df is non-empty
+    if not df.empty:
         min_d, max_d = df["date"].min().date(), df["date"].max().date()
         default_start = max(min_d, (df["date"].max() - pd.Timedelta(days=180)).date())
         date_range = st.slider(
@@ -208,6 +444,8 @@ with tab_glucose:
             value=(default_start, max_d), format="YYYY-MM-DD", key="glucose_date_range"
         )
         mask = (df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= date_range[1])
+    else:
+        mask = pd.Series(dtype=bool)
 
     # Glucose mean over time with 70-180 shaded band
     if "glucose_mean" in metric_cols:
@@ -226,7 +464,7 @@ with tab_glucose:
                          annotation_text="Target Range", annotation_position="right")
             fig.update_layout(title="Glucose Mean Over Time", height=400,
                             yaxis_title="Glucose (mg/dL)", xaxis_title="Date")
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
     # Time in range over time
     if "time_in_range" in metric_cols:
@@ -241,7 +479,80 @@ with tab_glucose:
                          annotation_text="Target: 70%", annotation_position="right")
             fig.update_layout(title="Time in Range Over Time", height=400,
                             yaxis_title="Time in Range (%)", xaxis_title="Date")
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("#### Post-Meal Glucose Response")
+
+    food_logs_all = load_daily_log()
+    if not food_logs_all.empty and "logged_time" in food_logs_all.columns:
+        food_logs_timed = food_logs_all[
+            (food_logs_all["entry_type"] == "food") &
+            (food_logs_all["logged_time"].notna()) &
+            (food_logs_all["logged_time"] != "")
+        ].copy()
+    else:
+        food_logs_timed = pd.DataFrame()
+
+    cgm_raw = load_cgm_raw()
+
+    if not food_logs_timed.empty and not cgm_raw.empty:
+        meal_colors = {
+            "Breakfast": "blue",
+            "Lunch": "green",
+            "Dinner": "orange",
+            "Snack": "purple",
+        }
+        fig_meal = go.Figure()
+        traces_added = 0
+        seen_meal_types = set()
+
+        for _, row in food_logs_timed.iterrows():
+            try:
+                meal_dt = pd.to_datetime(str(row["date"]) + " " + str(row["logged_time"]))
+            except Exception:
+                continue
+            window_start = meal_dt - pd.Timedelta(minutes=30)
+            window_end = meal_dt + pd.Timedelta(minutes=120)
+            segment = cgm_raw[
+                (cgm_raw["timestamp"] >= window_start) &
+                (cgm_raw["timestamp"] <= window_end)
+            ].copy()
+            if segment.empty:
+                continue
+            segment["minutes"] = (segment["timestamp"] - meal_dt).dt.total_seconds() / 60
+            meal_type = str(row.get("meal_type", "Meal")) if pd.notna(row.get("meal_type")) else "Meal"
+            color = meal_colors.get(meal_type, "gray")
+            show_legend = meal_type not in seen_meal_types
+            seen_meal_types.add(meal_type)
+            fig_meal.add_trace(go.Scatter(
+                x=segment["minutes"],
+                y=segment["glucose"],
+                mode="lines",
+                name=meal_type,
+                line=dict(color=color),
+                opacity=0.6,
+                legendgroup=meal_type,
+                showlegend=show_legend,
+            ))
+            traces_added += 1
+
+        if traces_added > 0:
+            fig_meal.add_vline(x=0, line_dash="dash", line_color="gray",
+                               annotation_text="Meal time", annotation_position="top right")
+            fig_meal.add_hrect(y0=70, y1=180, fillcolor="green", opacity=0.08, line_width=0,
+                               annotation_text="Target Range", annotation_position="right")
+            fig_meal.update_layout(
+                title="CGM Response by Meal (-30 to +120 min)",
+                height=420,
+                xaxis_title="Minutes from meal",
+                yaxis_title="Glucose (mg/dL)",
+            )
+            st.plotly_chart(fig_meal, use_container_width=True)
+        else:
+            st.info("No CGM data found near logged meal times.")
+    else:
+        st.info("Log meals with times in the Daily Log tab to see glucose response curves.")
 
 # ---------------------------------------------------------------- Labs
 with tab_labs:
@@ -295,12 +606,12 @@ with tab_labs:
 
             fig.update_layout(title=f"{selected_test} Over Time", height=400,
                             yaxis_title="Value", xaxis_title="Date")
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
             # Show recent results table
             st.markdown("#### Recent Results")
             recent_results = test_data[["date", "value", "ref_low", "ref_high"]].tail(5).sort_values("date", ascending=False)
-            st.dataframe(recent_results, width="stretch")
+            st.dataframe(recent_results, use_container_width=True)
 
 # ---------------------------------------------------------------- Trends
 with tab_trends:
@@ -335,7 +646,7 @@ with tab_trends:
                                  mode="lines", name="7-day avg",
                                  line=dict(width=3)))
         fig.update_layout(title=label(m), height=320, margin=dict(t=40, b=20))
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------- Correlations
 with tab_corr:
@@ -430,7 +741,7 @@ with tab_log:
     view_mode = st.radio("Mode", ["Log entry", "View log"], horizontal=True, label_visibility="collapsed")
 
     if view_mode == "Log entry":
-        entry_type = st.radio("What are you logging?", ["Sleep", "Food"], horizontal=True, label_visibility="collapsed")
+        entry_type = st.radio("What are you logging?", ["Sleep", "Food", "Quick check-in"], horizontal=True, label_visibility="collapsed")
 
         if entry_type == "Sleep":
             st.markdown("#### 😴 Log Sleep")
@@ -448,7 +759,7 @@ with tab_log:
                     st.success("Sleep logged!")
                     st.rerun()
 
-        else:  # Food
+        elif entry_type == "Food":
             st.markdown("#### 🍽️ Log Food")
             with st.form("food_log_form"):
                 log_date = st.date_input("Date", value=datetime.today())
@@ -466,12 +777,54 @@ with tab_log:
                     else:
                         st.error("Please upload a food photo.")
 
+        else:  # Quick check-in
+            st.markdown("#### ⚡ Quick Check-in")
+            st.caption("Tiny daily inputs wearables can't capture — they make your "
+                       "dataset richer for spotting patterns. Log whatever's quick.")
+            ql_date = st.date_input("Date", value=datetime.today(), key="ql_date")
+            with st.form("quick_log_form", clear_on_submit=True):
+                pending = {}
+                for kind, spec in quick_log.QUICK_TYPES.items():
+                    lbl = f"{spec['emoji']} {spec['prompt']}"
+                    kind_in = spec["input"]
+                    if kind_in == "scale_1_5":
+                        pending[kind] = ("scale", st.slider(lbl, 1, 5, 3, key=f"ql_{kind}"))
+                    elif kind_in == "bool":
+                        pending[kind] = ("bool", st.checkbox(lbl, key=f"ql_{kind}"))
+                    elif kind_in == "number":
+                        pending[kind] = ("number", st.number_input(
+                            lbl, min_value=spec.get("min", 0.0),
+                            max_value=spec.get("max"), step=spec.get("step", 1.0),
+                            value=0.0, key=f"ql_{kind}"))
+                    else:  # text
+                        pending[kind] = ("text", st.text_input(lbl, key=f"ql_{kind}"))
+                if st.form_submit_button("Save check-in"):
+                    saved = 0
+                    for kind, (typ, val) in pending.items():
+                        if typ == "text":
+                            if val and val.strip():
+                                quick_log.add_entry(ql_date, kind, text=val.strip())
+                                saved += 1
+                        elif typ == "bool":
+                            quick_log.add_entry(ql_date, kind, value=1 if val else 0)
+                            saved += 1
+                        elif typ == "number":
+                            if val and val > 0:
+                                quick_log.add_entry(ql_date, kind, value=val)
+                                saved += 1
+                        else:  # scale
+                            quick_log.add_entry(ql_date, kind, value=val)
+                            saved += 1
+                    st.success(f"Saved {saved} check-in entries for {ql_date}.")
+                    st.rerun()
+
     else:  # View log
         st.markdown("#### 📋 View Log")
         view_date = st.date_input("Filter by date", value=datetime.today(), key="view_date")
         logs = load_daily_log(str(view_date))
+        quick_today = quick_log.load_entries(str(view_date))
 
-        if logs.empty:
+        if logs.empty and quick_today.empty:
             st.info("No entries for this date.")
         else:
             sleep_logs = logs[logs["entry_type"] == "sleep"]
@@ -505,3 +858,112 @@ with tab_log:
                         if st.button("Delete", key=f"del_food_{row['id']}"):
                             delete_daily_log(row["id"])
                             st.rerun()
+
+            if not quick_today.empty:
+                st.markdown("**Quick Check-ins**")
+                for _, row in quick_today.iterrows():
+                    spec = quick_log.QUICK_TYPES.get(row["kind"], {})
+                    emoji = spec.get("emoji", "•")
+                    name = spec.get("label", row["kind"])
+                    if pd.notna(row["value"]):
+                        disp = f"{emoji} **{name}:** {row['value']:g} {spec.get('unit', '')}".strip()
+                    else:
+                        disp = f"{emoji} **{name}:** {row['text']}"
+                    c1, c2 = st.columns([0.85, 0.15])
+                    c1.markdown(disp)
+                    if c2.button("Delete", key=f"del_quick_{row['id']}"):
+                        quick_log.delete_entry(row["id"])
+                        st.rerun()
+
+# ---------------------------------------------------------------- Learn
+with tab_learn:
+    st.subheader("📚 Learn")
+    st.caption("Plain-language explanations of every number on your dashboard.")
+
+    metric_keys = list(education.METRIC_INFO.keys())
+    pick = st.selectbox("Explain a metric", metric_keys,
+                        format_func=lambda k: education.METRIC_INFO[k]["name"])
+    info = education.explain(pick)
+    if info:
+        st.markdown(f"### {info['name']}")
+        st.markdown(education.help_text(pick))
+
+    st.divider()
+    st.markdown("#### Glossary")
+    for term, definition in education.GLOSSARY:
+        st.markdown(f"**{term}** — {definition}")
+
+# ---------------------------------------------------------------- Weekly Summary
+with tab_summary:
+    st.subheader("AI Weekly Summary")
+    st.caption("Powered by Claude — synthesizes your last 7 days into actionable insights")
+
+    try:
+        last_date = df["date"].max()
+        week = df[df["date"] > last_date - pd.Timedelta(days=7)]
+        prev_week = df[(df["date"] <= last_date - pd.Timedelta(days=7)) &
+                       (df["date"] > last_date - pd.Timedelta(days=14))]
+
+        def fmt(series, decimals=1):
+            v = series.mean()
+            return f"{v:.{decimals}f}" if pd.notna(v) else "N/A"
+
+        def fmt_delta(cur_series, prev_series, decimals=1):
+            c, p = cur_series.mean(), prev_series.mean()
+            if pd.isna(c) or pd.isna(p) or p == 0:
+                return ""
+            return f" (vs {p:.{decimals}f} last week)"
+
+        week_stats = f"""Date range: {(last_date - pd.Timedelta(days=7)).strftime('%Y-%m-%d')} to {last_date.strftime('%Y-%m-%d')}
+- Average glucose: {fmt(week['glucose_mean'])} mg/dL{fmt_delta(week['glucose_mean'], prev_week['glucose_mean'])}
+- Time in range: {fmt(week['time_in_range'])}%{fmt_delta(week['time_in_range'], prev_week['time_in_range'])}
+- GMI (est. A1c): {fmt(week['gmi'], 2)}%
+- Sleep: {fmt(week['sleep_hours'])} hrs/night
+- Steps: {fmt(week['steps'], 0)}/day
+- Exercise: {fmt(week['exercise_minutes'], 0)} min/day
+- Weight: {fmt(week['weight_lbs'])} lbs"""
+
+        labs_df_s = load_labs()
+        a1c_rows = labs_df_s[labs_df_s["test"] == "Hemoglobin A1c"].sort_values("date")
+        if not a1c_rows.empty:
+            a1c_trend = " → ".join(
+                f"{row['value']:.1f}% ({pd.Timestamp(row['date']).strftime('%b %Y')})"
+                for _, row in a1c_rows.iterrows()
+            )
+            lab_trend = f"A1c: {a1c_trend}"
+            egfr_rows = labs_df_s[labs_df_s["test"] == "eGFR"].sort_values("date")
+            if not egfr_rows.empty:
+                latest_egfr = egfr_rows.iloc[-1]
+                lab_trend += f"\nLatest eGFR: {latest_egfr['value']:.0f} mL/min ({pd.Timestamp(latest_egfr['date']).strftime('%b %Y')})"
+            creat_rows = labs_df_s[labs_df_s["test"] == "Creatinine"].sort_values("date")
+            if not creat_rows.empty:
+                latest_creat = creat_rows.iloc[-1]
+                lab_trend += f"\nLatest Creatinine: {latest_creat['value']:.2f} mg/dL"
+        else:
+            lab_trend = "No lab data available"
+
+        corr_df = df[metric_cols].corr()
+        if "glucose_mean" in corr_df.columns:
+            glucose_corr = corr_df["glucose_mean"].drop("glucose_mean").sort_values(key=abs, ascending=False).head(3)
+            correlations = "\n".join(
+                f"- {label(m)} → glucose_mean: r = {r:+.2f}"
+                for m, r in glucose_corr.items()
+            )
+        else:
+            correlations = "No correlation data available"
+
+        col_btn, col_note = st.columns([1, 3])
+        if col_btn.button("Generate Summary", type="primary"):
+            st.cache_data.clear()
+
+        with st.spinner("Asking Claude to analyze your week..."):
+            summary = generate_weekly_summary(week_stats, lab_trend, correlations)
+
+        st.markdown(summary)
+        st.divider()
+        st.caption("**This week's data sent to Claude:**")
+        with st.expander("View prompt data"):
+            st.code(f"{week_stats}\n\nLabs:\n{lab_trend}\n\nCorrelations:\n{correlations}")
+    except Exception as e:
+        st.error(f"Error in Weekly Summary tab: {str(e)}")
+        st.write(f"Debug info: last_date = {last_date if 'last_date' in locals() else 'N/A'}")

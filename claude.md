@@ -1,410 +1,125 @@
-# Project Plan: Trajectory
+# Trajectory — Project Guide
 
-## An AI-Powered N-of-1 Health Experimentation Platform
+An AI-powered **N-of-1 health experimentation platform**. A Streamlit dashboard for a single
+participant (the author's father, "Ravi" — 56yo, Type 2 diabetes) that unifies CGM, Apple Watch,
+and lab data into one SQLite database, surfaces trends/correlations, lets him run personal
+experiments, and generates an AI weekly summary.
 
-### Project Goal
-
-Build a platform that transforms wearable and biomarker data into scientifically structured personal health experiments.
-
-The initial user is a single participant (my father) with:
-
-* Type 2 diabetes
-* Continuous glucose monitoring
-* Apple Watch
-* Withings scale
-* Laboratory testing
-
-The objective is to determine whether AI can help identify causal relationships between behaviors and health outcomes more effectively than existing health dashboards.
+> This file is the canonical guide for coding agents. Keep it current when you change architecture,
+> data flow, or add features.
 
 ---
 
-# Problem
+## Environment & how to run
 
-Healthcare has become extremely effective at collecting data.
-
-Examples:
-
-* Continuous glucose monitors
-* Smart watches
-* Smart scales
-* Laboratory testing
-
-However, patients still struggle to answer:
-
-* Which habits improve my health?
-* Which interventions matter most?
-* How do I know if a change actually worked?
-
-Current products focus on observation.
-
-Very few products focus on experimentation.
+- **Use the project venv**: `./venv/bin/python` and `./venv/bin/streamlit`. The system `python3` is
+  externally-managed and lacks `pandas`.
+- **Ingest data** (build `health.db`): `./venv/bin/python ingest.py`
+  - From open-wearables API instead of CSVs: `./venv/bin/python ingest.py --source ow`
+- **Run the app**: `./venv/bin/streamlit run app.py`
+- **Headless runtime test** (catches errors across all tabs without a browser):
+  ```python
+  from streamlit.testing.v1 import AppTest
+  at = AppTest.from_file("app.py", default_timeout=60).run()
+  assert not at.exception
+  ```
 
 ---
 
-# Hypothesis
+## Architecture baseline
 
-Individuals can meaningfully improve health outcomes when provided with:
+| Layer | Choice |
+|---|---|
+| Frontend | Streamlit (`app.py`) |
+| Data pipeline | `ingest.py` → `health.db` (SQLite) |
+| AI layer | Gemini via `google-generativeai` (note: UI caption says "Claude" but the call is Gemini) |
+| Analysis | pandas; `scikit-learn`/`statsmodels` listed for future regression work |
 
-1. Continuous biological data
-2. Structured experimentation frameworks
-3. AI-generated insight synthesis
-4. Longitudinal feedback loops
+### Files
 
----
+| File | Role |
+|---|---|
+| `app.py` | Dashboard. 10 tabs (see below). Runs top-to-bottom on every interaction. |
+| `ingest.py` | ETL → `daily_metrics` + `lab_results`. Apple source switchable via `--source {csv,ow}`. |
+| `healthdata.py` | Standalone Apple Health `export.xml` → per-type CSV extractor. |
+| `ow_client.py` | **(new)** open-wearables REST API client (httpx). Never raises; degrades to empty. |
+| `goals.py` | **(new)** long-term goals backend (`goals` table) + progress/trajectory math. |
+| `education.py` | **(new)** plain-language metric explanations + glossary. Pure data, no Streamlit. |
+| `quick_log.py` | **(new)** low-friction daily check-ins (`quick_entries` table). |
+| `.streamlit/secrets.toml` | `GEMINI_API_KEY`; optional `OW_API_URL`/`OW_API_KEY`/`OW_USER_ID`. |
 
-# Phase 1: Data Collection
+### Database (`health.db`) tables
 
-## Objective
+- `daily_metrics` — one row/date: `glucose_mean/min/max/std`, `time_in_range`, `gmi`, `steps`,
+  `sleep_hours`, `hrv`, `resting_hr`, `active_calories`, `exercise_minutes`, `weight_lbs`,
+  `body_fat_pct`, `lean_mass_lbs`, `systolic`, `diastolic`.
+- `lab_results` — `date, panel, test, value, unit, ref_low, ref_high, flag`. Seeded from the
+  hardcoded `LAB_DATA` list in `ingest.py`.
+- `experiments` — N-of-1 experiment definitions (hypothesis, intervention, window, success_metric).
+- `daily_log` — sleep-quality ratings + food photos (BLOB), with `logged_time` for CGM alignment.
+- `goals` **(new)** — long-term targets. Created lazily by `goals.init_table()`.
+- `quick_entries` **(new)** — subjective/contextual signals. Created lazily by `quick_log.init_table()`.
 
-Create a unified health dataset.
+### Data sources (paths are hardcoded for the single user)
 
-### Data Sources
+| Source | Method | Location |
+|---|---|---|
+| Apple Health | CSV (default) **or** open-wearables API (`--source ow`) | `RAVI_APPLE_DIR` / OW API |
+| Libre3 CGM | LibreView CSV | `/Users/amrutha/Downloads/test results/libre3_cgm.csv` |
+| Lab results | Manual (`LAB_DATA` in `ingest.py`) | n/a |
 
-#### LibreView
+### `app.py` tabs
 
-Metrics:
-
-* Glucose
-* Time in Range
-* Average glucose
-* GMI
-* Glucose variability
-
-Collection Method:
-
-* CSV export
-
-#### Apple Health
-
-Metrics:
-
-* Sleep duration
-* Sleep consistency
-* Resting heart rate
-* HRV
-* Steps
-* Exercise
-
-Collection Method:
-
-* Apple Health XML export
-
-#### Withings
-
-Metrics:
-
-* Weight
-* Body fat
-* Muscle mass
-* Visceral fat estimate
-
-Collection Method:
-
-* CSV export initially
-* API later
-
-#### Laboratory Results
-
-Metrics:
-
-* A1c
-* Lipid panel
-* Kidney function
-* Fasting glucose
-
-Collection Method:
-
-* Manual entry
+`Overview · Goals · Glucose · Labs · Trends · Correlations · Experiments · Daily Log · Learn · Weekly Summary`
 
 ---
 
-# Deliverable 1
+## Open-Wearables integration (plan + status)
 
-Unified dataset.
+Reference: https://github.com/the-momentum/open-wearables — a self-hosted FastAPI platform exposing a
+unified REST API for 13 wearable providers (Garmin, Polar, Whoop, Oura, Fitbit, Apple HealthKit, etc.),
+with OAuth, webhooks, and mobile SDKs.
 
-Schema:
+**Metric mapping (OW `SeriesType` → `daily_metrics` column):** `resting_heart_rate`→`resting_hr`,
+`heart_rate_variability_sdnn`→`hrv`, `steps`→`steps`, `energy`→`active_calories`,
+`exercise_time`→`exercise_minutes`, `weight`→`weight_lbs`, `body_fat_percentage`→`body_fat_pct`,
+`lean_body_mass`→`lean_mass_lbs`, `blood_pressure_*`→`systolic`/`diastolic`, sleep summaries→`sleep_hours`.
 
-Date
+**Status — Option B implemented.** `ingest.py --source ow` pulls Apple Health metrics from the OW
+summary endpoints via `ow_client.fetch_apple_metrics()` instead of reading CSVs; on any failure it
+prints a warning and **falls back to CSV**. CGM and lab ingestion are unchanged. Configure with env or
+`.streamlit/secrets.toml` keys `OW_API_URL` / `OW_API_KEY` / `OW_USER_ID`.
 
-Glucose Metrics
-Sleep Metrics
-Exercise Metrics
-Body Composition Metrics
-Medication Changes
-Nutrition Notes
+**Not covered by OW** (keep custom ingestion): LibreView CGM, Withings scale, clinical labs.
 
----
-
-# Phase 2: Analytics Layer
-
-## Objective
-
-Identify meaningful predictors.
-
-### Questions
-
-What predicts:
-
-* improved Time in Range?
-* lower glucose variability?
-* lower average glucose?
-* weight loss?
-
-### Analysis Methods
-
-Correlation
-
-Example:
-
-Sleep vs Glucose
-
-Regression
-
-Example:
-
-Sleep
-Steps
-Weight
-
-Predicting:
-
-Average Glucose
-
-Time-Series Analysis
-
-Identify delayed effects.
-
-Example:
-
-Poor sleep today
-
-Affects glucose tomorrow
+**Future — Option C:** live sync via OW webhooks + mobile SDK (continuous HealthKit push), eliminating
+manual exports entirely.
 
 ---
 
-# Deliverable 2
+## Recent UX feature additions
 
-Personal Metabolic Report
+Centered on **long-term health goals, education, and easy data collection** (richer datasets):
 
-Outputs:
-
-Top positive predictors
-
-Top negative predictors
-
-Potential confounders
-
-Behavior ranking
-
----
-
-# Phase 3: Experiment Framework
-
-## Objective
-
-Build a structured experimentation engine.
-
-### Experiment Components
-
-Hypothesis
-
-Intervention
-
-Duration
-
-Success Metric
-
-Compliance Threshold
+- **Goals tab** (`goals.py`): set targets (e.g. A1c < 7.0%, Time in Range > 70%, Weight < 180 lb),
+  see per-goal progress bars, current→target, trend arrows, on-track/off-track via linear
+  extrapolation to the target date, and an overall progress score. `GOALABLE` lists goal-able metrics
+  + clinical defaults; `compute_progress()` is defensive and never raises.
+- **Learn tab + hover help** (`education.py`): every metric card exposes an `ℹ️` tooltip
+  (`st.metric(help=education.help_text(col))`). The Learn tab gives full What/Why/Target/Lever
+  explanations plus a layperson glossary (CGM, TIR, GMI, A1c, HRV, eGFR, …).
+- **Quick check-in** (Daily Log tab → `quick_log.py`): one-tap daily logging of mood, energy, stress,
+  medication adherence, water, weight, symptoms, notes — the contextual signals wearables can't capture.
+  Stored in `quick_entries`. `quick_log.daily_rollup()` returns a date-indexed numeric frame **ready to
+  merge into `daily_metrics` for correlations** (a good next step, not yet wired into the Correlations tab).
 
 ---
 
-### Example
-
-Hypothesis:
-
-15-minute walk after dinner reduces glucose spikes.
-
-Intervention:
-
-Walk after dinner.
-
-Duration:
-
-14 days.
-
-Success Metric:
-
-Peak glucose.
-
-Compliance:
-
-80%.
-
----
-
-# Deliverable 3
-
-Experiment Builder Interface
-
-User selects:
-
-* sleep
-* exercise
-* nutrition
-* timing
-* medication discussion topics
-
-System generates protocol.
-
----
-
-# Phase 4: AI Research Assistant
-
-## Objective
-
-Automate interpretation.
-
-Inputs:
-
-* biomarker data
-* experiment data
-* compliance data
-
-Outputs:
-
-Research-style report.
-
-Example:
-
-Experiment #4
-
-Hypothesis:
-
-Earlier bedtime improves glucose control.
-
-Result:
-
-Average glucose improved 12%.
-
-Confidence:
-
-Moderate.
-
-Recommendation:
-
-Continue intervention.
-
----
-
-# Phase 5: Prediction Layer
-
-## Objective
-
-Build personalized health models.
-
-Questions:
-
-What happens if:
-
-* bedtime shifts by 1 hour?
-* weight decreases by 10 pounds?
-* post-meal walking increases?
-
-Outputs:
-
-Projected effects on:
-
-* glucose
-* A1c
-* weight
-* Time in Range
-
----
-
-# Technical Architecture
-
-Frontend
-
-Streamlit
-
-Version 1
-
-React
-
-Version 2
-
-Backend
-
-Python
-
-Libraries:
-
-Pandas
-
-Scikit-Learn
-
-Statsmodels
-
-Database
-
-SQLite
-
-Version 1
-
-Postgres
-
-Version 2
-
-AI Layer
-
-OpenAI API
-
-Functions:
-
-Insight generation
-
-Experiment design
-
-Report generation
-
----
-
-# Success Metrics
-
-Clinical
-
-Improved Time in Range
-
-Lower glucose variability
-
-Reduced A1c
-
-Behavioral
-
-Experiments completed
-
-Intervention adherence
-
-Weekly engagement
-
-Product
-
-Actionable insights generated
-
-Prediction accuracy
-
-Retention
-
----
-
-# Portfolio Outcome
-
-Demonstrate ability to:
-
-* Integrate healthcare data systems
-* Design AI products
-* Apply systems thinking to medicine
-* Translate biological signals into interventions
-* Build a precision-health platform
-
-This project serves as a bridge between biology, healthcare, product management, AI, and digital health innovation.
+## Conventions for agents
+
+- Always use `./venv/bin/python` / `./venv/bin/streamlit`.
+- New persistence modules own their table and create it lazily (`CREATE TABLE IF NOT EXISTS` in an
+  idempotent `init_table()`), so a fresh DB never errors and no migration step is needed.
+- Be defensive with health data: return `None`/empty rather than raising on missing values.
+- Compute `DB_PATH` relative to the module file: `os.path.join(os.path.dirname(os.path.abspath(__file__)), "health.db")`.
+- `app.py` runs entirely on each interaction — keep heavy loads behind `@st.cache_data`.

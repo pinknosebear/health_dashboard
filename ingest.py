@@ -15,6 +15,14 @@ import sys
 
 import pandas as pd
 
+# Optional open-wearables REST source. Guard the import so CSV mode still works
+# even if httpx (ow_client's dependency) is not installed.
+try:
+    import ow_client
+    HAS_OW_CLIENT = True
+except ImportError:
+    HAS_OW_CLIENT = False
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, "health.db")
 RAVI_APPLE_DIR = "/Users/amrutha/Downloads/test results"
@@ -167,9 +175,16 @@ def aggregate_cgm(cgm_path):
     return daily.set_index("date")
 
 
-def build_database(cgm_path):
-    print("Aggregating Apple Health data...")
-    apple = aggregate_apple(RAVI_APPLE_DIR)
+def build_database(cgm_path, source="csv"):
+    if source == "ow":
+        print("Fetching Apple Health data from open-wearables...")
+        apple = ow_client.fetch_apple_metrics() if HAS_OW_CLIENT else pd.DataFrame()
+        if apple.empty:
+            print("  ! open-wearables returned no data, falling back to CSV")
+            apple = aggregate_apple(RAVI_APPLE_DIR)
+    else:
+        print("Aggregating Apple Health data...")
+        apple = aggregate_apple(RAVI_APPLE_DIR)
     print(f"  -> {len(apple)} days from Apple Health")
 
     print("Aggregating CGM data...")
@@ -211,6 +226,7 @@ def build_database(cgm_path):
         CREATE TABLE IF NOT EXISTS daily_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
+            logged_time TEXT,
             entry_type TEXT NOT NULL,
             meal_type TEXT,
             rating INTEGER,
@@ -318,5 +334,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cgm", default=CGM_PATH,
                         help="Path to CGM CSV file")
+    parser.add_argument("--source", choices=["csv", "ow"], default="csv",
+                        help="Apple Health source: local CSVs (csv) or open-wearables API (ow)")
     args = parser.parse_args()
-    build_database(args.cgm)
+    build_database(args.cgm, source=args.source)
