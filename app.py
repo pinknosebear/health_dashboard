@@ -168,17 +168,26 @@ with tab_glucose:
 
     # KPI cards
     col1, col2, col3 = st.columns(3)
-    if "glucose_mean" in metric_cols:
-        latest_glucose = df[df["glucose_mean"].notna()].iloc[-1] if not df[df["glucose_mean"].notna()].empty else None
-        if latest_glucose is not None:
-            col1.metric("Latest Avg Glucose", f"{latest_glucose['glucose_mean']:.1f} mg/dL",
-                       f"({latest_glucose['date'].strftime('%Y-%m-%d')})")
 
-    if "time_in_range" in metric_cols:
-        latest_tir = df[df["time_in_range"].notna()].iloc[-1] if not df[df["time_in_range"].notna()].empty else None
-        if latest_tir is not None:
-            col2.metric("Latest Time in Range", f"{latest_tir['time_in_range']:.1f}%",
-                       f"({latest_tir['date'].strftime('%Y-%m-%d')})")
+    try:
+        if "glucose_mean" in metric_cols:
+            glucose_data = df[df["glucose_mean"].notna()]
+            if not glucose_data.empty:
+                latest_glucose = glucose_data.iloc[-1]
+                col1.metric("Latest Avg Glucose", f"{latest_glucose['glucose_mean']:.1f} mg/dL",
+                           f"({pd.Timestamp(latest_glucose['date']).strftime('%Y-%m-%d')})")
+    except Exception as e:
+        col1.error(f"Error loading glucose: {str(e)[:50]}")
+
+    try:
+        if "time_in_range" in metric_cols:
+            tir_data = df[df["time_in_range"].notna()]
+            if not tir_data.empty:
+                latest_tir = tir_data.iloc[-1]
+                col2.metric("Latest Time in Range", f"{latest_tir['time_in_range']:.1f}%",
+                           f"({pd.Timestamp(latest_tir['date']).strftime('%Y-%m-%d')})")
+    except Exception as e:
+        col2.error(f"Error loading TIR: {str(e)[:50]}")
 
     labs_df = load_labs()
     if not labs_df.empty:
@@ -203,7 +212,11 @@ with tab_glucose:
     # Glucose mean over time with 70-180 shaded band
     if "glucose_mean" in metric_cols:
         st.markdown("#### Glucose Mean (mg/dL)")
-        glucose_sub = df[mask][["date", "glucose_mean"]].dropna()
+        try:
+            glucose_sub = df[mask][["date", "glucose_mean"]].dropna()
+        except Exception as e:
+            st.error(f"Error filtering glucose data: {e}")
+            glucose_sub = pd.DataFrame()
 
         if not glucose_sub.empty:
             fig = go.Figure()
