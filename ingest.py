@@ -171,6 +171,19 @@ def build_database(withings_dir):
             status TEXT DEFAULT 'active'
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            entry_type TEXT NOT NULL,
+            meal_type TEXT,
+            rating INTEGER,
+            notes TEXT,
+            photo BLOB,
+            photo_filename TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     conn.commit()
     conn.close()
 

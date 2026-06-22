@@ -64,6 +64,36 @@ def add_experiment(name, hypothesis, intervention, start, end, metric, notes):
     conn.close()
 
 
+def load_daily_log(date_str=None):
+    conn = sqlite3.connect(DB_PATH)
+    q = "SELECT * FROM daily_log"
+    if date_str:
+        q += f" WHERE date = '{date_str}'"
+    q += " ORDER BY created_at DESC"
+    df = pd.read_sql(q, conn)
+    conn.close()
+    return df
+
+
+def add_daily_log(date, entry_type, meal_type, rating, notes, photo_bytes, photo_filename):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO daily_log
+           (date, entry_type, meal_type, rating, notes, photo, photo_filename)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (str(date), entry_type, meal_type, rating, notes, photo_bytes, photo_filename),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_daily_log(log_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM daily_log WHERE id = ?", (log_id,))
+    conn.commit()
+    conn.close()
+
+
 def label(col):
     return METRIC_LABELS.get(col, col)
 
@@ -78,8 +108,8 @@ metric_cols = [c for c in df.columns if c != "date" and df[c].notna().any()]
 st.title("📈 Trajectory")
 st.caption("An AI-powered N-of-1 health experimentation platform")
 
-tab_overview, tab_trends, tab_corr, tab_exp = st.tabs(
-    ["Overview", "Trends", "Correlations", "Experiments"]
+tab_overview, tab_trends, tab_corr, tab_exp, tab_log = st.tabs(
+    ["Overview", "Trends", "Correlations", "Experiments", "Daily Log"]
 )
 
 # ---------------------------------------------------------------- Overview
@@ -229,3 +259,87 @@ with tab_exp:
                 pass
             fig.update_layout(title=f"{choice}: {label(metric)}", height=380)
             st.plotly_chart(fig, width="stretch")
+
+# ---------------------------------------------------------------- Daily Log
+with tab_log:
+    st.subheader("Daily Log")
+    st.caption("Log sleep quality and food photos to track daily patterns")
+
+    view_mode = st.radio("Mode", ["Log entry", "View log"], horizontal=True, label_visibility="collapsed")
+
+    if view_mode == "Log entry":
+        entry_type = st.radio("What are you logging?", ["Sleep", "Food"], horizontal=True, label_visibility="collapsed")
+
+        if entry_type == "Sleep":
+            st.markdown("#### 😴 Log Sleep")
+            with st.form("sleep_log_form"):
+                log_date = st.date_input("Date", value=datetime.today())
+                quality = st.slider("Sleep quality", 1, 5, 3,
+                                    help="1=Poor, 5=Excellent")
+                photo = st.file_uploader("Upload sleep screenshot (optional)", type=["png", "jpg", "jpeg"])
+                notes = st.text_area("Notes", placeholder="e.g., fell asleep at 11pm, woke at 7am")
+                if st.form_submit_button("Log sleep"):
+                    photo_bytes = photo.read() if photo else None
+                    photo_name = photo.name if photo else None
+                    add_daily_log(log_date, "sleep", None, quality, notes,
+                                  photo_bytes, photo_name)
+                    st.success("Sleep logged!")
+                    st.rerun()
+
+        else:  # Food
+            st.markdown("#### 🍽️ Log Food")
+            with st.form("food_log_form"):
+                log_date = st.date_input("Date", value=datetime.today())
+                meal = st.selectbox("Meal", ["Breakfast", "Lunch", "Dinner", "Snack"])
+                photo = st.file_uploader("Upload food photo", type=["png", "jpg", "jpeg"], key="food_photo")
+                notes = st.text_area("Notes", placeholder="e.g., ingredients, portion size, restaurant")
+                if st.form_submit_button("Log food"):
+                    if photo:
+                        photo_bytes = photo.read()
+                        photo_name = photo.name
+                        add_daily_log(log_date, "food", meal, None, notes,
+                                      photo_bytes, photo_name)
+                        st.success(f"{meal} logged!")
+                        st.rerun()
+                    else:
+                        st.error("Please upload a food photo.")
+
+    else:  # View log
+        st.markdown("#### 📋 View Log")
+        view_date = st.date_input("Filter by date", value=datetime.today(), key="view_date")
+        logs = load_daily_log(str(view_date))
+
+        if logs.empty:
+            st.info("No entries for this date.")
+        else:
+            sleep_logs = logs[logs["entry_type"] == "sleep"]
+            food_logs = logs[logs["entry_type"] == "food"]
+
+            if not sleep_logs.empty:
+                st.markdown("**Sleep Entries**")
+                for _, row in sleep_logs.iterrows():
+                    c1, c2 = st.columns([0.8, 0.2])
+                    with c1:
+                        stars = "⭐" * int(row["rating"]) if pd.notna(row["rating"]) else "—"
+                        st.write(f"{stars} {row['notes']}")
+                        if pd.notna(row["photo_filename"]):
+                            st.image(row["photo"], width=150)
+                    with c2:
+                        if st.button("Delete", key=f"del_sleep_{row['id']}"):
+                            delete_daily_log(row["id"])
+                            st.rerun()
+                    st.divider()
+
+            if not food_logs.empty:
+                st.markdown("**Food Entries**")
+                cols = st.columns(2)
+                for i, (_, row) in enumerate(food_logs.iterrows()):
+                    with cols[i % 2]:
+                        st.write(f"**{row['meal_type']}**")
+                        if pd.notna(row["photo"]):
+                            st.image(row["photo"], width=200, caption=row.get("notes", ""))
+                        else:
+                            st.write(row.get("notes", "—"))
+                        if st.button("Delete", key=f"del_food_{row['id']}"):
+                            delete_daily_log(row["id"])
+                            st.rerun()
