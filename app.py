@@ -282,12 +282,12 @@ with tab_labs:
 
             fig.update_layout(title=f"{selected_test} Over Time", height=400,
                             yaxis_title="Value", xaxis_title="Date")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             # Show recent results table
             st.markdown("#### Recent Results")
             recent_results = test_data[["date", "value", "ref_low", "ref_high"]].tail(5).sort_values("date", ascending=False)
-            st.dataframe(recent_results, use_container_width=True)
+            st.dataframe(recent_results, width="stretch")
 
 # ---------------------------------------------------------------- Trends
 with tab_trends:
